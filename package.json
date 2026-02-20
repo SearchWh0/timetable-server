@@ -1,0 +1,12 @@
+{
+  "name": "timetable-server",
+  "version": "1.0.0",
+  "description": "Timetable sync server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
