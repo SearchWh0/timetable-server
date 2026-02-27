@@ -1,12 +1,12 @@
 {
   "name": "timetable-server",
   "version": "1.0.0",
-  "description": "Timetable sync server",
+  "description": "Timetable + observation script backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=18"
+  "dependencies": {
+    "redis": "^4.6.13"
   }
 }
