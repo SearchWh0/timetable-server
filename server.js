@@ -8,9 +8,10 @@ const REDIS_URL      = process.env.REDIS_URL;       // injected by Render when R
 const CYCLE_START    = new Date('2026-02-23T00:00:00Z');
 
 // Redis keys
-const K_TIMETABLE = 'timetable';
-const K_PHRASES   = 'obs:phrases';
-const K_STATS     = 'obs:stats';
+const K_TIMETABLE  = 'timetable';
+const K_PHRASES    = 'obs:phrases';
+const K_STATS      = 'obs:stats';
+const K_HEARTBEAT  = 'obs:heartbeat';  // { user: isoTimestamp }
 
 // ── Default phrases ────────────────────────────────────────────────────────
 const DEFAULT_PHRASES = {
@@ -326,6 +327,35 @@ const server = http.createServer(async (req, res) => {
       byKey[key].count++;
     });
     json(res, 200, { user, total: mine.length, byKey });
+    return;
+  }
+
+  // POST /heartbeat — AHK pings this every 2 min while script is open
+  // Body: { user }  — no password needed, low-value data
+  if (req.method==='POST' && url==='/heartbeat') {
+    try {
+      const { user } = JSON.parse(await readBody(req));
+      if (!user) throw new Error('user required');
+      const beats = (await redisGet(K_HEARTBEAT)) || {};
+      beats[user] = new Date().toISOString();
+      await redisSet(K_HEARTBEAT, beats);
+      json(res, 200, { ok: true });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  // GET /heartbeat — dashboard polls this to show who's online
+  if (req.method==='GET' && url==='/heartbeat') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    const beats = (await redisGet(K_HEARTBEAT)) || {};
+    // Mark anyone seen in last 3 minutes as online
+    const now = Date.now();
+    const result = {};
+    for (const [user, ts] of Object.entries(beats)) {
+      const ageMs = now - new Date(ts).getTime();
+      result[user] = { lastSeen: ts, online: ageMs < 3 * 60 * 1000 };
+    }
+    json(res, 200, result);
     return;
   }
 
