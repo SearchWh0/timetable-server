@@ -429,6 +429,29 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // GET /users/killed — returns the full killed map (admin)
+  if (req.method==='GET' && url==='/users/killed') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    const data = (await redisGet(K_KILLED)) || {};
+    json(res, 200, data);
+    return;
+  }
+
+  // POST /exit/user — flags a single user for exit (admin)
+  if (req.method==='POST' && url==='/exit/user') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    try {
+      const { user } = JSON.parse(await readBody(req));
+      if (!user) throw new Error('user required');
+      const exits = (await redisGet(K_EXIT)) || {};
+      exits[user] = true;
+      await redisSet(K_EXIT, exits);
+      console.log('[exit] flag set for single user:', user);
+      json(res, 200, { ok: true, user });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
   // POST /exit/all — admin closes all running scripts remotely
   // Sets exit flag for every known user — cleared one-at-a-time as each user's AHK reads it
   if (req.method==='POST' && url==='/exit/all') {
