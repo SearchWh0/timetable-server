@@ -13,6 +13,9 @@ const K_PHRASES    = 'obs:phrases';
 const K_STATS      = 'obs:stats';
 const K_HEARTBEAT  = 'obs:heartbeat';  // { user: isoTimestamp }
 const K_KILLED     = 'obs:killed';      // { user: true/false }
+const K_FIRSTSEEN  = 'obs:firstseen';   // { user: isoTimestamp }
+const K_EXIT      = 'obs:exit';       // { user: true } — cleared after AHK reads it
+const K_VERSIONS  = 'obs:versions';   // { user: versionString }
 
 // ── Default phrases ────────────────────────────────────────────────────────
 const DEFAULT_PHRASES = {
@@ -289,6 +292,12 @@ const server = http.createServer(async (req, res) => {
       data.events.push({ ts: new Date().toISOString(), user, key, label: label||key });
       if (data.events.length > 50000) data.events = data.events.slice(-50000);
       await redisSet(K_STATS, data);
+      // Record first-seen timestamp for this user
+      const firstSeen = (await redisGet(K_FIRSTSEEN)) || {};
+      if (!firstSeen[user]) {
+        firstSeen[user] = new Date().toISOString();
+        await redisSet(K_FIRSTSEEN, firstSeen);
+      }
       json(res, 200, { ok: true });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
@@ -335,11 +344,17 @@ const server = http.createServer(async (req, res) => {
   // Body: { user }  — no password needed, low-value data
   if (req.method==='POST' && url==='/heartbeat') {
     try {
-      const { user } = JSON.parse(await readBody(req));
+      const { user, version } = JSON.parse(await readBody(req));
       if (!user) throw new Error('user required');
       const beats = (await redisGet(K_HEARTBEAT)) || {};
       beats[user] = new Date().toISOString();
       await redisSet(K_HEARTBEAT, beats);
+      // Store version if provided
+      if (version) {
+        const versions = (await redisGet(K_VERSIONS)) || {};
+        versions[user] = version;
+        await redisSet(K_VERSIONS, versions);
+      }
       json(res, 200, { ok: true });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
@@ -348,15 +363,30 @@ const server = http.createServer(async (req, res) => {
   // GET /heartbeat — dashboard polls this to show who's online
   if (req.method==='GET' && url==='/heartbeat') {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
-    const beats = (await redisGet(K_HEARTBEAT)) || {};
+    const beats    = (await redisGet(K_HEARTBEAT)) || {};
+    const versions = (await redisGet(K_VERSIONS))  || {};
+    const exits    = (await redisGet(K_EXIT))       || {};
     // Mark anyone seen in last 3 minutes as online
     const now = Date.now();
     const result = {};
     for (const [user, ts] of Object.entries(beats)) {
       const ageMs = now - new Date(ts).getTime();
-      result[user] = { lastSeen: ts, online: ageMs < 3 * 60 * 1000 };
+      result[user] = {
+        lastSeen: ts,
+        online:   ageMs < 3 * 60 * 1000,
+        version:  versions[user] || null,
+        exitPending: !!exits[user]
+      };
     }
     json(res, 200, result);
+    return;
+  }
+
+  // GET /stats/firstseen — returns { user: firstSeenTimestamp } for all users (admin)
+  if (req.method==='GET' && url==='/stats/firstseen') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    const data = (await redisGet(K_FIRSTSEEN)) || {};
+    json(res, 200, data);
     return;
   }
 
@@ -378,14 +408,47 @@ const server = http.createServer(async (req, res) => {
   }
 
   // GET /user/status?user=X — AHK script checks this on startup and periodically
-  // Returns { killed: true/false } — no password needed (low risk, user-specific)
+  // Returns { killed: true/false, exit: true/false }
+  // exit flag is one-shot: cleared immediately after being read so AHK only fires once
   if (req.method==='GET' && url==='/user/status') {
     try {
-      const qs   = new URLSearchParams(req.url.split('?')[1]||'');
-      const user = (qs.get('user')||'').trim();
+      const qs      = new URLSearchParams(req.url.split('?')[1]||'');
+      const user    = (qs.get('user')||'').trim();
       if (!user) throw new Error('user required');
-      const data = (await redisGet(K_KILLED)) || {};
-      json(res, 200, { user, killed: !!data[user] });
+      const killed  = (await redisGet(K_KILLED))  || {};
+      const exits      = (await redisGet(K_EXIT))     || {};
+      const shouldExit = !!exits[user];
+      // Clear the flag immediately so this user only gets told once
+      if (shouldExit) {
+        delete exits[user];
+        await redisSet(K_EXIT, exits);
+        console.log(`[exit] cleared flag for ${user}`);
+      }
+      json(res, 200, { user, killed: !!killed[user], exit: shouldExit });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  // POST /exit/all — admin closes all running scripts remotely
+  // Sets exit flag for every known user — cleared one-at-a-time as each user's AHK reads it
+  if (req.method==='POST' && url==='/exit/all') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    try {
+      const body = req.headers['content-length'] > 0 ? JSON.parse(await readBody(req)) : {};
+      // Target: specific user list from body, or all heartbeat users, or all stats users
+      const beats  = (await redisGet(K_HEARTBEAT)) || {};
+      const stats  = (await redisGet(K_STATS))     || { events: [] };
+      // Collect all known usernames
+      const allUsers = new Set([
+        ...Object.keys(beats),
+        ...stats.events.map(e => e.user).filter(Boolean)
+      ]);
+      if (body.users) body.users.forEach(u => allUsers.add(u));
+      const updates = {};
+      allUsers.forEach(u => { updates[u] = true; });
+      await redisSet(K_EXIT, updates);
+      console.log(`[exit] flag set for ${allUsers.size} users:`, [...allUsers]);
+      json(res, 200, { ok: true, flagged: [...allUsers] });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
