@@ -12,6 +12,7 @@ const K_TIMETABLE  = 'timetable';
 const K_PHRASES    = 'obs:phrases';
 const K_STATS      = 'obs:stats';
 const K_HEARTBEAT  = 'obs:heartbeat';  // { user: isoTimestamp }
+const K_KILLED     = 'obs:killed';      // { user: true/false }
 
 // ── Default phrases ────────────────────────────────────────────────────────
 const DEFAULT_PHRASES = {
@@ -356,6 +357,36 @@ const server = http.createServer(async (req, res) => {
       result[user] = { lastSeen: ts, online: ageMs < 3 * 60 * 1000 };
     }
     json(res, 200, result);
+    return;
+  }
+
+  // POST /user/kill — admin sets a user as killed or re-enabled
+  // Body: { user, killed: true/false }
+  if (req.method==='POST' && url==='/user/kill') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    try {
+      const { user, killed } = JSON.parse(await readBody(req));
+      if (!user) throw new Error('user required');
+      const data = (await redisGet(K_KILLED)) || {};
+      if (killed) data[user] = true;
+      else delete data[user];
+      await redisSet(K_KILLED, data);
+      console.log(`[kill] ${user} => ${killed ? 'disabled' : 're-enabled'}`);
+      json(res, 200, { ok: true, user, killed: !!killed });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  // GET /user/status?user=X — AHK script checks this on startup and periodically
+  // Returns { killed: true/false } — no password needed (low risk, user-specific)
+  if (req.method==='GET' && url==='/user/status') {
+    try {
+      const qs   = new URLSearchParams(req.url.split('?')[1]||'');
+      const user = (qs.get('user')||'').trim();
+      if (!user) throw new Error('user required');
+      const data = (await redisGet(K_KILLED)) || {};
+      json(res, 200, { user, killed: !!data[user] });
+    } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
 
