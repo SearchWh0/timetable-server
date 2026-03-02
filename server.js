@@ -4,18 +4,18 @@ const { createClient } = require('redis');
 // ── Config ─────────────────────────────────────────────────────────────────
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
 const PORT           = process.env.PORT || 3000;
-const REDIS_URL      = process.env.REDIS_URL;       // injected by Render when Redis is linked
+const REDIS_URL      = process.env.REDIS_URL;
 const CYCLE_START    = new Date('2026-02-23T00:00:00Z');
 
 // Redis keys
 const K_TIMETABLE  = 'timetable';
 const K_PHRASES    = 'obs:phrases';
 const K_STATS      = 'obs:stats';
-const K_HEARTBEAT  = 'obs:heartbeat';  // { user: isoTimestamp }
-const K_KILLED     = 'obs:killed';      // { user: true/false }
-const K_FIRSTSEEN  = 'obs:firstseen';   // { user: isoTimestamp }
-const K_EXIT      = 'obs:exit';       // { user: true } — cleared after AHK reads it
-const K_VERSIONS  = 'obs:versions';   // { user: versionString }
+const K_HEARTBEAT  = 'obs:heartbeat';
+const K_KILLED     = 'obs:killed';
+const K_FIRSTSEEN  = 'obs:firstseen';
+const K_EXIT       = 'obs:exit';
+const K_VERSIONS   = 'obs:versions';
 
 // ── Default phrases ────────────────────────────────────────────────────────
 const DEFAULT_PHRASES = {
@@ -44,7 +44,6 @@ const DEFAULT_PHRASES = {
 };
 
 // ── Redis client ───────────────────────────────────────────────────────────
-// Falls back to in-memory if REDIS_URL not set (local dev / before linking)
 let redis = null;
 const memStore = {};
 
@@ -72,6 +71,13 @@ async function redisDel(key) {
 // ── Helpers ────────────────────────────────────────────────────────────────
 function todayStr() {
   const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+// Returns the local date string (AEST/server timezone) for a given ISO timestamp
+function localDateStrFromISO(isoTs) {
+  const d = new Date(isoTs);
+  // Use server's local time (same as todayStr above)
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 
@@ -109,7 +115,7 @@ function json(res, status, data) {
 
 function authFail(res) { json(res, 401, { error: 'Unauthorized' }); }
 
-// ── Timetable row parser (Power Automate) ──────────────────────────────────
+// ── Timetable row parser ───────────────────────────────────────────────────
 const EXCLUDED_COLORS = new Set(['#ffffe1','#ffffe0']);
 function isWhiteish(hex) {
   if (!hex||hex==='none'||hex==='') return true;
@@ -158,7 +164,6 @@ const server = http.createServer(async (req, res) => {
 
   const url = req.url.split('?')[0];
 
-  // GET / — health
   if (req.method==='GET' && url==='/') {
     json(res, 200, {
       status: 'ok',
@@ -186,7 +191,6 @@ const server = http.createServer(async (req, res) => {
       if (!payload.map) throw new Error('Missing map');
       const stored = { date: todayStr(), map: payload.map, names: payload.names||{} };
       await redisSet(K_TIMETABLE, stored);
-      console.log(`[timetable] saved to ${redis?'Redis':'memory'} — ${Object.keys(payload.map).length} groups`);
       json(res, 200, { ok: true });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
@@ -209,7 +213,6 @@ const server = http.createServer(async (req, res) => {
       const existing = await redisGet(K_TIMETABLE);
       const names = payload.names || (existing ? existing.names : {});
       await redisSet(K_TIMETABLE, { date: todayStr(), map, names });
-      console.log(`[automate] saved to ${redis?'Redis':'memory'} — ${Object.keys(map).length} groups`);
       json(res, 200, { ok: true, groups: Object.keys(map).length });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
@@ -288,14 +291,35 @@ const server = http.createServer(async (req, res) => {
     try {
       const { user, key, label } = JSON.parse(await readBody(req));
       if (!user||!key) throw new Error('user and key required');
-      const data = (await redisGet(K_STATS)) || { events: [] };
-      data.events.push({ ts: new Date().toISOString(), user, key, label: label||key });
+      const data = (await redisGet(K_STATS)) || { events: [], byUserDay: {} };
+
+      const ts  = new Date().toISOString();
+      const day = localDateStrFromISO(ts);
+
+      data.events.push({ ts, user, key, label: label||key });
       if (data.events.length > 50000) data.events = data.events.slice(-50000);
+
+      // ── Maintain byUserDay aggregate ───────────────────────────────────
+      // byUserDay: { "username": { "2026-03-02": { phrases: N, utility: N } } }
+      // This lets the dashboard show accurate today/week/month counts
+      // without relying on the capped recentEvents window.
+      const UTILITY_KEYS = new Set(['Ctrl+Alt+E','Ctrl+Alt+T','Ctrl+Alt+P','Ctrl+Alt+F','Ctrl+Alt+W','Ctrl+Alt+S','Ctrl+Alt+M','__heartbeat__']);
+      if (!data.byUserDay) data.byUserDay = {};
+      if (!data.byUserDay[user]) data.byUserDay[user] = {};
+      if (!data.byUserDay[user][day]) data.byUserDay[user][day] = { phrases: 0, utility: 0 };
+      if (UTILITY_KEYS.has(key)) {
+        // Don't count heartbeats at all — they're not real usage
+        if (key !== '__heartbeat__') data.byUserDay[user][day].utility++;
+      } else {
+        data.byUserDay[user][day].phrases++;
+      }
+
       await redisSet(K_STATS, data);
-      // Record first-seen timestamp for this user
+
+      // Record first-seen timestamp
       const firstSeen = (await redisGet(K_FIRSTSEEN)) || {};
       if (!firstSeen[user]) {
-        firstSeen[user] = new Date().toISOString();
+        firstSeen[user] = ts;
         await redisSet(K_FIRSTSEEN, firstSeen);
       }
       json(res, 200, { ok: true });
@@ -305,8 +329,9 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method==='GET' && url==='/stats') {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
-    const data = (await redisGet(K_STATS)) || { events: [] };
+    const data = (await redisGet(K_STATS)) || { events: [], byUserDay: {} };
     const byKey={}, byUser={}, byDay={};
+
     data.events.forEach(({ ts, user, key, label }) => {
       if (!byKey[key]) byKey[key]={ label, total:0, byUser:{} };
       byKey[key].total++;
@@ -317,10 +342,14 @@ const server = http.createServer(async (req, res) => {
       const day=ts.slice(0,10);
       byDay[day]=(byDay[day]||0)+1;
     });
+
     json(res, 200, {
       totalEvents: data.events.length,
-      byKey, byUser, byDay,
-      recentEvents: data.events.slice(-200).reverse()
+      byKey,
+      byUser,
+      byDay,
+      byUserDay: data.byUserDay || {},   // ← NEW: accurate per-user daily counts
+      recentEvents: data.events.slice(-2000).reverse()  // increased from 200
     });
     return;
   }
@@ -340,8 +369,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST /heartbeat — AHK pings this every 2 min while script is open
-  // Body: { user }  — no password needed, low-value data
+  // ══════════════════════════════════════════════
+  //  HEARTBEAT
+  // ══════════════════════════════════════════════
+
   if (req.method==='POST' && url==='/heartbeat') {
     try {
       const { user, version } = JSON.parse(await readBody(req));
@@ -349,7 +380,6 @@ const server = http.createServer(async (req, res) => {
       const beats = (await redisGet(K_HEARTBEAT)) || {};
       beats[user] = new Date().toISOString();
       await redisSet(K_HEARTBEAT, beats);
-      // Store version if provided
       if (version) {
         const versions = (await redisGet(K_VERSIONS)) || {};
         versions[user] = version;
@@ -360,13 +390,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET /heartbeat — dashboard polls this to show who's online
   if (req.method==='GET' && url==='/heartbeat') {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
     const beats    = (await redisGet(K_HEARTBEAT)) || {};
     const versions = (await redisGet(K_VERSIONS))  || {};
     const exits    = (await redisGet(K_EXIT))       || {};
-    // Mark anyone seen in last 3 minutes as online
     const now = Date.now();
     const result = {};
     for (const [user, ts] of Object.entries(beats)) {
@@ -382,7 +410,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET /stats/firstseen — returns { user: firstSeenTimestamp } for all users (admin)
+  // ══════════════════════════════════════════════
+  //  USER MANAGEMENT
+  // ══════════════════════════════════════════════
+
   if (req.method==='GET' && url==='/stats/firstseen') {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
     const data = (await redisGet(K_FIRSTSEEN)) || {};
@@ -390,8 +421,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST /user/kill — admin sets a user as killed or re-enabled
-  // Body: { user, killed: true/false }
   if (req.method==='POST' && url==='/user/kill') {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
     try {
@@ -401,35 +430,28 @@ const server = http.createServer(async (req, res) => {
       if (killed) data[user] = true;
       else delete data[user];
       await redisSet(K_KILLED, data);
-      console.log(`[kill] ${user} => ${killed ? 'disabled' : 're-enabled'}`);
       json(res, 200, { ok: true, user, killed: !!killed });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
 
-  // GET /user/status?user=X — AHK script checks this on startup and periodically
-  // Returns { killed: true/false, exit: true/false }
-  // exit flag is one-shot: cleared immediately after being read so AHK only fires once
   if (req.method==='GET' && url==='/user/status') {
     try {
       const qs      = new URLSearchParams(req.url.split('?')[1]||'');
       const user    = (qs.get('user')||'').trim();
       if (!user) throw new Error('user required');
       const killed  = (await redisGet(K_KILLED))  || {};
-      const exits      = (await redisGet(K_EXIT))     || {};
+      const exits   = (await redisGet(K_EXIT))     || {};
       const shouldExit = !!exits[user];
-      // Clear the flag immediately so this user only gets told once
       if (shouldExit) {
         delete exits[user];
         await redisSet(K_EXIT, exits);
-        console.log(`[exit] cleared flag for ${user}`);
       }
       json(res, 200, { user, killed: !!killed[user], exit: shouldExit });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
 
-  // GET /users/killed — returns the full killed map (admin)
   if (req.method==='GET' && url==='/users/killed') {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
     const data = (await redisGet(K_KILLED)) || {};
@@ -437,7 +459,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST /exit/user — flags a single user for exit (admin)
   if (req.method==='POST' && url==='/exit/user') {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
     try {
@@ -446,22 +467,17 @@ const server = http.createServer(async (req, res) => {
       const exits = (await redisGet(K_EXIT)) || {};
       exits[user] = true;
       await redisSet(K_EXIT, exits);
-      console.log('[exit] flag set for single user:', user);
       json(res, 200, { ok: true, user });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
 
-  // POST /exit/all — admin closes all running scripts remotely
-  // Sets exit flag for every known user — cleared one-at-a-time as each user's AHK reads it
   if (req.method==='POST' && url==='/exit/all') {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
     try {
       const body = req.headers['content-length'] > 0 ? JSON.parse(await readBody(req)) : {};
-      // Target: specific user list from body, or all heartbeat users, or all stats users
       const beats  = (await redisGet(K_HEARTBEAT)) || {};
       const stats  = (await redisGet(K_STATS))     || { events: [] };
-      // Collect all known usernames
       const allUsers = new Set([
         ...Object.keys(beats),
         ...stats.events.map(e => e.user).filter(Boolean)
@@ -470,7 +486,6 @@ const server = http.createServer(async (req, res) => {
       const updates = {};
       allUsers.forEach(u => { updates[u] = true; });
       await redisSet(K_EXIT, updates);
-      console.log(`[exit] flag set for ${allUsers.size} users:`, [...allUsers]);
       json(res, 200, { ok: true, flagged: [...allUsers] });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
@@ -479,7 +494,7 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404); res.end();
 });
 
-// ── Startup — connect Redis first, then listen ─────────────────────────────
+// ── Startup ────────────────────────────────────────────────────────────────
 async function start() {
   if (REDIS_URL) {
     try {
