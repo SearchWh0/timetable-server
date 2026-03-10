@@ -157,6 +157,70 @@ function parseRows(rows) {
   return Object.keys(groupMap).length?groupMap:null;
 }
 
+// ── Parse Power Automate / bookmarklet Graph cells ─────────────────────────
+// Accepts a 2D array of { value, bg, fg } cell objects covering A1:V88
+// bg/fg are CSS hex strings (e.g. "#a3c4f3" or "")
+function normaliseHex(raw) {
+  if (!raw) return null;
+  let h = raw.replace('#','').toLowerCase();
+  if (h.length === 8) h = h.slice(2); // strip ARGB alpha
+  if (h.length === 3) h = h.split('').map(c=>c+c).join('');
+  if (h.length !== 6) return null;
+  return '#' + h;
+}
+
+function parseGraphCells(cells) {
+  if (!cells || !cells.length) return null;
+  const REF_ROW = 2;
+  const numCols = Math.max(...cells.map(r => r.length));
+
+  // Find period numbers from ref row
+  const refRow = cells[REF_ROW] || [];
+  const periodNums = [];
+  for (let c = 0; c < numCols; c++) {
+    const val = refRow[c] ? String(refRow[c].value || '').trim() : '';
+    const n = parseInt(val, 10);
+    periodNums[c] = (n >= 1 && n <= 6) ? n : null;
+  }
+
+  // Find first data column (first coloured cell outside ref row)
+  let dataStartCol = null;
+  outer: for (let c = 0; c < numCols; c++)
+    for (let r = 0; r < cells.length; r++) {
+      if (r === REF_ROW) continue;
+      const cell = cells[r][c];
+      if (!cell) continue;
+      const bg = normaliseHex(cell.bg);
+      if (bg && !isWhiteish(bg) && !EXCLUDED_COLORS.has(bg)) { dataStartCol = c; break outer; }
+    }
+  if (dataStartCol === null) return null;
+
+  const groupMap = {};
+  for (let r = 0; r < cells.length; r++) {
+    if (r === REF_ROW) continue;
+    const row = cells[r] || [];
+    for (let c = dataStartCol; c < numCols; c += 3) {
+      const c0 = row[c], c1 = row[c+1], c2 = row[c+2];
+      if (!c0) continue;
+      const bg = normaliseHex(c0.bg);
+      if (!bg || isWhiteish(bg) || EXCLUDED_COLORS.has(bg)) continue;
+      const d1 = String(c0.value || '').trim();
+      const d2 = String((c1 && c1.value) || '').trim();
+      const d3 = String((c2 && c2.value) || '').trim();
+      if (!d1 && !d2 && !d3) continue;
+      const rawFg = normaliseHex(c0.fg);
+      const fg = (rawFg && !isBlackish(rawFg)) ? rawFg : null;
+      const key = bg + '||' + (fg || '');
+      const p = periodNums[c];
+      if (!p) continue;
+      if (!groupMap[key]) groupMap[key] = { bg, fg, slots: {} };
+      if (!groupMap[key].slots[p]) groupMap[key].slots[p] = [];
+      groupMap[key].slots[p].push({ d1, d2, d3 });
+    }
+  }
+  return Object.keys(groupMap).length ? groupMap : null;
+}
+
 // ── HTTP server ────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   cors(res);
@@ -215,6 +279,31 @@ const server = http.createServer(async (req, res) => {
       await redisSet(K_TIMETABLE, { date: todayStr(), map, names });
       json(res, 200, { ok: true, groups: Object.keys(map).length });
     } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  if (req.method==='POST' && url==='/automate/graph') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    try {
+      const payload = JSON.parse(await readBody(req));
+      if (!Array.isArray(payload.cells)) throw new Error('Missing cells array');
+      const map = parseGraphCells(payload.cells);
+      if (!map) throw new Error('No coloured groups found in cells');
+      const existing = await redisGet(K_TIMETABLE);
+      const names = payload.names || (existing ? existing.names : {});
+      await redisSet(K_TIMETABLE, {
+        date: todayStr(),
+        sheet: payload.sheet || sheetNameForDate(new Date()) || 'unknown',
+        map,
+        names,
+        source: 'bookmarklet'
+      });
+      console.log(`[automate/graph] Pushed "${payload.sheet}" — ${Object.keys(map).length} groups`);
+      json(res, 200, { ok: true, groups: Object.keys(map).length, sheet: payload.sheet });
+    } catch(e) {
+      console.error('[automate/graph] Error:', e.message);
+      json(res, 400, { error: e.message });
+    }
     return;
   }
 
@@ -490,6 +579,7 @@ const server = http.createServer(async (req, res) => {
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
+
 
   res.writeHead(404); res.end();
 });
