@@ -387,7 +387,7 @@ Rules:
 - Respond with ONLY valid JSON, no markdown fences, no explanation.`;
 
       const body = JSON.stringify({
-        model: 'google/gemini-2.0-flash-exp:free',
+        model: 'google/gemini-2.0-flash-lite-001',
         messages: [{
           role: 'user',
           content: [
