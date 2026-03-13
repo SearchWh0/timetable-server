@@ -12,6 +12,7 @@ const CYCLE_START      = new Date('2026-02-23T00:00:00Z');
 // Redis keys
 const K_TIMETABLE      = 'timetable';
 const K_DAILY_CHANGES  = 'daily-changes';
+const K_MAP_LAYOUT     = 'map-layout';
 const K_PHRASES        = 'obs:phrases';
 const K_STATS          = 'obs:stats';
 const K_HEARTBEAT      = 'obs:heartbeat';
@@ -348,6 +349,24 @@ const server = http.createServer(async (req, res) => {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
     await redisDel(K_DAILY_CHANGES);
     json(res, 200, { ok: true });
+    return;
+  }
+
+  // ── Map layout (room group positions) ────────────────────────────────────
+  if (req.method==='GET' && url==='/map-layout') {
+    const data = await redisGet(K_MAP_LAYOUT);
+    if (!data) { json(res, 404, { error: 'No map layout saved yet' }); return; }
+    json(res, 200, data);
+    return;
+  }
+
+  if (req.method==='POST' && url==='/map-layout') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    try {
+      const payload = JSON.parse(await readBody(req));
+      await redisSet(K_MAP_LAYOUT, payload);
+      json(res, 200, { ok: true });
+    } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
 
