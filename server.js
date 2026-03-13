@@ -6,7 +6,7 @@ const { createClient } = require('redis');
 const ADMIN_PASSWORD   = process.env.ADMIN_PASSWORD || 'changeme';
 const PORT             = process.env.PORT || 3000;
 const REDIS_URL        = process.env.REDIS_URL;
-const GEMINI_KEY       = process.env.GEMINI_API_KEY || '';
+const OPENROUTER_KEY   = process.env.OPENROUTER_API_KEY || '';
 const CYCLE_START      = new Date('2026-02-23T00:00:00Z');
 
 // Redis keys
@@ -351,10 +351,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── Read image via Gemini (free tier, server-side proxy) ──────────────────
+  // ── Read image via OpenRouter (free tier) ─────────────────────────────────
   if (req.method==='POST' && url==='/read-image') {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
-    if (!GEMINI_KEY) { json(res, 503, { error: 'GEMINI_API_KEY not set on server. Get a free key at aistudio.google.com and add it as an environment variable in Render.' }); return; }
+    if (!OPENROUTER_KEY) { json(res, 503, { error: 'OPENROUTER_API_KEY not set. Get a free key at openrouter.ai and add it as an environment variable in Render.' }); return; }
     try {
       const { imageBase64, imageMime } = JSON.parse(await readBody(req));
       if (!imageBase64 || !imageMime) { json(res, 400, { error: 'imageBase64 and imageMime required' }); return; }
@@ -387,23 +387,27 @@ Rules:
 - Respond with ONLY valid JSON, no markdown fences, no explanation.`;
 
       const body = JSON.stringify({
-        contents: [{
-          parts: [
-            { inline_data: { mime_type: imageMime, data: imageBase64 } },
-            { text: prompt }
+        model: 'google/gemini-2.0-flash-exp:free',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image_url', image_url: { url: `data:${imageMime};base64,${imageBase64}` } },
+            { type: 'text', text: prompt }
           ]
         }]
       });
 
       const result = await new Promise((resolve, reject) => {
-        const path = `/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`;
         const opts = {
-          hostname: 'generativelanguage.googleapis.com',
-          path,
+          hostname: 'openrouter.ai',
+          path: '/api/v1/chat/completions',
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(body)
+            'Content-Length': Buffer.byteLength(body),
+            'Authorization': `Bearer ${OPENROUTER_KEY}`,
+            'HTTP-Referer': 'https://timetable-server-r6nb.onrender.com',
+            'X-Title': 'LSO Timetable'
           }
         };
         const r = https.request(opts, resp => {
@@ -417,15 +421,15 @@ Rules:
       });
 
       if (result.status !== 200) {
-        console.error('[read-image] Gemini error', result.status, result.body);
+        console.error('[read-image] OpenRouter error', result.status, result.body);
         let detail = result.body;
-        try { detail = JSON.parse(result.body)?.error?.message || result.body; } catch(e) {}
-        json(res, 502, { error: `Gemini error: ${detail}` });
+        try { detail = JSON.parse(result.body)?.error?.message || detail; } catch(e) {}
+        json(res, 502, { error: `OpenRouter error: ${detail}` });
         return;
       }
 
       const parsed = JSON.parse(result.body);
-      const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const text = parsed.choices?.[0]?.message?.content || '';
       json(res, 200, { text });
     } catch(e) {
       console.error('[read-image]', e);
