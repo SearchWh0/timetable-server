@@ -1,21 +1,24 @@
 const http   = require('http');
+const https  = require('https');
 const { createClient } = require('redis');
 
 // ── Config ─────────────────────────────────────────────────────────────────
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
-const PORT           = process.env.PORT || 3000;
-const REDIS_URL      = process.env.REDIS_URL;
-const CYCLE_START    = new Date('2026-02-23T00:00:00Z');
+const ADMIN_PASSWORD   = process.env.ADMIN_PASSWORD || 'changeme';
+const PORT             = process.env.PORT || 3000;
+const REDIS_URL        = process.env.REDIS_URL;
+const ANTHROPIC_KEY    = process.env.ANTHROPIC_API_KEY || '';
+const CYCLE_START      = new Date('2026-02-23T00:00:00Z');
 
 // Redis keys
-const K_TIMETABLE  = 'timetable';
-const K_PHRASES    = 'obs:phrases';
-const K_STATS      = 'obs:stats';
-const K_HEARTBEAT  = 'obs:heartbeat';
-const K_KILLED     = 'obs:killed';
-const K_FIRSTSEEN  = 'obs:firstseen';
-const K_EXIT       = 'obs:exit';
-const K_VERSIONS   = 'obs:versions';
+const K_TIMETABLE      = 'timetable';
+const K_DAILY_CHANGES  = 'daily-changes';
+const K_PHRASES        = 'obs:phrases';
+const K_STATS          = 'obs:stats';
+const K_HEARTBEAT      = 'obs:heartbeat';
+const K_KILLED         = 'obs:killed';
+const K_FIRSTSEEN      = 'obs:firstseen';
+const K_EXIT           = 'obs:exit';
+const K_VERSIONS       = 'obs:versions';
 
 // ── Default phrases ────────────────────────────────────────────────────────
 const DEFAULT_PHRASES = {
@@ -318,6 +321,118 @@ const server = http.createServer(async (req, res) => {
       }
       json(res, 200, { ok: true });
     } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  // ── Daily Changes ────────────────────────────────────────────────────────
+
+  if (req.method==='GET' && url==='/daily-changes') {
+    const data = await redisGet(K_DAILY_CHANGES);
+    if (!data) { json(res, 404, { error: 'No daily changes published' }); return; }
+    json(res, 200, data);
+    return;
+  }
+
+  if (req.method==='POST' && url==='/daily-changes') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    try {
+      const payload = JSON.parse(await readBody(req));
+      await redisSet(K_DAILY_CHANGES, payload);
+      console.log(`[daily-changes] Published for ${payload.date || 'unknown date'}`);
+      json(res, 200, { ok: true });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  if (req.method==='DELETE' && url==='/daily-changes') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    await redisDel(K_DAILY_CHANGES);
+    json(res, 200, { ok: true });
+    return;
+  }
+
+  // ── Read image via Claude (server-side proxy to avoid CORS + key exposure) ─
+  if (req.method==='POST' && url==='/read-image') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    if (!ANTHROPIC_KEY) { json(res, 503, { error: 'ANTHROPIC_API_KEY not set on server. Add it as an environment variable in Render.' }); return; }
+    try {
+      const { imageBase64, imageMime } = JSON.parse(await readBody(req));
+      if (!imageBase64 || !imageMime) { json(res, 400, { error: 'imageBase64 and imageMime required' }); return; }
+
+      const prompt = `You are reading a school LSO (Learning Support Officer) daily timetable changes sheet.
+
+Extract ALL information from this image into this exact JSON structure:
+{
+  "absent": ["Name1", "Name2"],
+  "date": "extracted date string if visible, else null",
+  "lsos": {
+    "LSO Name": {
+      "p1": "assignment text or null",
+      "p2": "assignment text or null",
+      "p3": "assignment text or null",
+      "p4": "assignment text or null",
+      "p5": "assignment text or null",
+      "p6": "assignment text or null"
+    }
+  },
+  "notes": "any general notes at the top of the sheet or null"
+}
+
+Rules:
+- Each row in the table is one LSO. Use exactly the name as written (first name only is fine).
+- Columns are periods P1 through P6.
+- For each period, copy the full assignment text (e.g. "Cover Indi", "LEC – No NAPLAN students", "Special Provisions NAPLAN Year 9 with Bella").
+- If a cell is empty or dashed, use null.
+- Absent LSOs mentioned at the top (e.g. "Absent: H'Onorine, Indi") go in the "absent" array.
+- Respond with ONLY valid JSON, no markdown fences, no explanation.`;
+
+      const body = JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: imageMime, data: imageBase64 } },
+            { type: 'text', text: prompt }
+          ]
+        }]
+      });
+
+      const result = await new Promise((resolve, reject) => {
+        const opts = {
+          hostname: 'api.anthropic.com',
+          path: '/v1/messages',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+            'x-api-key': ANTHROPIC_KEY,
+            'anthropic-version': '2023-06-01'
+          }
+        };
+        const r = https.request(opts, resp => {
+          let data = '';
+          resp.on('data', c => data += c);
+          resp.on('end', () => resolve({ status: resp.statusCode, body: data }));
+        });
+        r.on('error', reject);
+        r.write(body);
+        r.end();
+      });
+
+      if (result.status !== 200) {
+        console.error('[read-image] Anthropic error', result.status, result.body);
+        json(res, 502, { error: `Anthropic API error ${result.status}`, detail: result.body });
+        return;
+      }
+
+      const parsed = JSON.parse(result.body);
+      const text = (parsed.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+      json(res, 200, { text });
+    } catch(e) {
+      console.error('[read-image]', e);
+      json(res, 500, { error: e.message });
+    }
     return;
   }
 
