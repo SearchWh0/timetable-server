@@ -418,7 +418,9 @@ Rules:
 
       if (result.status !== 200) {
         console.error('[read-image] Gemini error', result.status, result.body);
-        json(res, 502, { error: `Gemini API error ${result.status}`, detail: result.body });
+        let detail = result.body;
+        try { detail = JSON.parse(result.body)?.error?.message || result.body; } catch(e) {}
+        json(res, 502, { error: `Gemini error: ${detail}` });
         return;
       }
 
