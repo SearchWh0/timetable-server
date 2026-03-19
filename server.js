@@ -471,8 +471,10 @@ IMPORTANT:
       }
 
       const parsed = JSON.parse(result.body);
-      const text = parsed.choices?.[0]?.message?.content || '';
-      console.log('[read-image] Raw response:', text.slice(0, 300));
+      let text = parsed.choices?.[0]?.message?.content || '';
+      // Strip markdown code fences Gemini sometimes wraps around JSON
+      text = text.replace(/^```json\s*/,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
+      console.log('[read-image] Cleaned response:', text.slice(0, 200));
       json(res, 200, { text });
     } catch(e) {
       console.error('[read-image]', e);
