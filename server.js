@@ -78,10 +78,8 @@ function todayStr() {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 
-// Returns the local date string (AEST/server timezone) for a given ISO timestamp
 function localDateStrFromISO(isoTs) {
   const d = new Date(isoTs);
-  // Use server's local time (same as todayStr above)
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 
@@ -162,12 +160,10 @@ function parseRows(rows) {
 }
 
 // ── Parse Power Automate / bookmarklet Graph cells ─────────────────────────
-// Accepts a 2D array of { value, bg, fg } cell objects covering A1:V88
-// bg/fg are CSS hex strings (e.g. "#a3c4f3" or "")
 function normaliseHex(raw) {
   if (!raw) return null;
   let h = raw.replace('#','').toLowerCase();
-  if (h.length === 8) h = h.slice(2); // strip ARGB alpha
+  if (h.length === 8) h = h.slice(2);
   if (h.length === 3) h = h.split('').map(c=>c+c).join('');
   if (h.length !== 6) return null;
   return '#' + h;
@@ -177,8 +173,6 @@ function parseGraphCells(cells) {
   if (!cells || !cells.length) return null;
   const REF_ROW = 2;
   const numCols = Math.max(...cells.map(r => r.length));
-
-  // Find period numbers from ref row
   const refRow = cells[REF_ROW] || [];
   const periodNums = [];
   for (let c = 0; c < numCols; c++) {
@@ -186,8 +180,6 @@ function parseGraphCells(cells) {
     const n = parseInt(val, 10);
     periodNums[c] = (n >= 1 && n <= 6) ? n : null;
   }
-
-  // Find first data column (first coloured cell outside ref row)
   let dataStartCol = null;
   outer: for (let c = 0; c < numCols; c++)
     for (let r = 0; r < cells.length; r++) {
@@ -198,7 +190,6 @@ function parseGraphCells(cells) {
       if (bg && !isWhiteish(bg) && !EXCLUDED_COLORS.has(bg)) { dataStartCol = c; break outer; }
     }
   if (dataStartCol === null) return null;
-
   const groupMap = {};
   for (let r = 0; r < cells.length; r++) {
     if (r === REF_ROW) continue;
@@ -352,7 +343,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── Map layout (room group positions) ────────────────────────────────────
+  // ── Map layout ────────────────────────────────────────────────────────────
   if (req.method==='GET' && url==='/map-layout') {
     const data = await redisGet(K_MAP_LAYOUT);
     if (!data) { json(res, 404, { error: 'No map layout saved yet' }); return; }
@@ -370,50 +361,82 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── Read image via OpenRouter (free tier) ─────────────────────────────────
+  // ── Read image via OpenRouter ─────────────────────────────────────────────
   if (req.method==='POST' && url==='/read-image') {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
-    if (!OPENROUTER_KEY) { json(res, 503, { error: 'OPENROUTER_API_KEY not set. Get a free key at openrouter.ai and add it as an environment variable in Render.' }); return; }
+    if (!OPENROUTER_KEY) {
+      json(res, 503, { error: 'OPENROUTER_API_KEY not set. Get a free key at openrouter.ai and add it as an environment variable in Render.' });
+      return;
+    }
     try {
       const { imageBase64, imageMime } = JSON.parse(await readBody(req));
       if (!imageBase64 || !imageMime) { json(res, 400, { error: 'imageBase64 and imageMime required' }); return; }
 
-      const prompt = `You are reading a school LSO (Learning Support Officer) daily timetable changes sheet.
+      // ── NEW STRUCTURED PROMPT ─────────────────────────────────────────────
+      // Returns changes[] with classCode, room, teacherCode per entry
+      const prompt = `You are reading a school LSO (Learning Support Officer) daily timetable changes sheet image.
 
-Extract ALL information from this image into this exact JSON structure:
+Return ONLY valid JSON — no markdown fences, no explanation, nothing else. Use this exact structure:
+
 {
-  "absent": ["Name1", "Name2"],
-  "date": "extracted date string if visible, else null",
-  "lsos": {
-    "LSO Name": {
-      "p1": "assignment text or null",
-      "p2": "assignment text or null",
-      "p3": "assignment text or null",
-      "p4": "assignment text or null",
-      "p5": "assignment text or null",
-      "p6": "assignment text or null"
+  "absent": [
+    { "name": "H'Onorine", "periods": null },
+    { "name": "Kylie", "periods": ["p1", "p2"] }
+  ],
+  "changes": [
+    {
+      "lso": "Harpreet",
+      "period": "p2",
+      "type": "cover",
+      "description": "Cover Paige",
+      "classCode": "08MMAT260CRAA",
+      "room": "BR1",
+      "teacherCode": "CRANL"
     }
-  },
-  "notes": "any general notes at the top of the sheet or null"
+  ],
+  "notes": null
 }
 
-Rules:
-- Each row in the table is one LSO. Use exactly the name as written (first name only is fine).
-- Columns are periods P1 through P6.
-- For each period, copy the full assignment text (e.g. "Cover Indi", "LEC – No NAPLAN students", "Special Provisions NAPLAN Year 9 with Bella").
-- If a cell is empty or dashed, use null.
-- Absent LSOs mentioned at the top (e.g. "Absent: H'Onorine, Indi") go in the "absent" array.
-- Respond with ONLY valid JSON, no markdown fences, no explanation.`;
+HOW TO READ THE IMAGE:
+
+ABSENT LINE: At the very top there is a bold "Absent –" line listing names separated by commas.
+- Extract each name into the absent array.
+- If a name has a period qualifier like "(P1 & P2)" extract it as periods: ["p1","p2"].
+- If no period qualifier, use periods: null (means absent all day).
+
+CHANGES TABLE: A grid with columns labelled P1, P2, P3, P4, P5, P6.
+Each table cell can contain one or more change entries. Each entry looks like:
+
+  PersonName – some description text
+  CLASSCODE
+  [ ROOM     TEACHERCODE ]   ← coloured/highlighted rectangle
+
+For EACH entry in EACH cell create one object in the changes array:
+- "lso": the bold person's first name (e.g. "Harpreet", "Michelle", "Beth")
+- "period": which column it is in — "p1", "p2", "p3", "p4", "p5", or "p6"
+- "type": "cover" if description contains "Cover", "cancelled" if cancelled/group cancelled, "other" for LEC/RCP/MacqLit/TAE admin/etc.
+- "description": the text after the dash (e.g. "Cover Paige", "Cover Farishat", "MacqLit for Paige", "LEC", "TAE admin")
+- "classCode": the alphanumeric code shown ABOVE the coloured box — it looks like digits followed by subject letters (e.g. "08MMAT260CRAA", "07EENG260CRAG", "07SSCI260CRAE", "07MMAT260CRAG", "08EENG260CRAD"). Copy it EXACTLY character by character.
+- "room": the text on the LEFT side of the coloured/highlighted rectangle (e.g. "BR1", "BR3", "BE1", "CL5", "CL1", "DOSC1"). Copy exactly.
+- "teacherCode": the text on the RIGHT side of the coloured/highlighted rectangle (e.g. "CRANL", "BHATM", "OVERL", "DINSS", "HEMMA", "YOUNL", "TSIAG", "CARLA"). Copy exactly.
+- If there is NO coloured box for an entry (e.g. MacqLit, LEC, RCP, TAE admin entries), set classCode: null, room: null, teacherCode: null.
+
+IMPORTANT:
+- Create one changes entry per person per period — if the same person has two entries in one period cell, create two objects.
+- Extract every single entry from every cell. Do not skip any.
+- The "lso" field uses first name only.
+- Do not invent data — only extract what is visibly written in the image.`;
 
       const body = JSON.stringify({
-        model: 'google/gemini-2.0-flash-lite-001',
+        model: 'google/gemini-2.0-flash-001',
         messages: [{
           role: 'user',
           content: [
             { type: 'image_url', image_url: { url: `data:${imageMime};base64,${imageBase64}` } },
             { type: 'text', text: prompt }
           ]
-        }]
+        }],
+        max_tokens: 3000
       });
 
       const result = await new Promise((resolve, reject) => {
@@ -449,6 +472,7 @@ Rules:
 
       const parsed = JSON.parse(result.body);
       const text = parsed.choices?.[0]?.message?.content || '';
+      console.log('[read-image] Raw response:', text.slice(0, 300));
       json(res, 200, { text });
     } catch(e) {
       console.error('[read-image]', e);
@@ -524,16 +548,11 @@ Rules:
       data.events.push({ ts, user, key, label: label||key });
       if (data.events.length > 50000) data.events = data.events.slice(-50000);
 
-      // ── Maintain byUserDay aggregate ───────────────────────────────────
-      // byUserDay: { "username": { "2026-03-02": { phrases: N, utility: N } } }
-      // This lets the dashboard show accurate today/week/month counts
-      // without relying on the capped recentEvents window.
       const UTILITY_KEYS = new Set(['Ctrl+Alt+E','Ctrl+Alt+T','Ctrl+Alt+P','Ctrl+Alt+F','Ctrl+Alt+W','Ctrl+Alt+S','Ctrl+Alt+M','__heartbeat__']);
       if (!data.byUserDay) data.byUserDay = {};
       if (!data.byUserDay[user]) data.byUserDay[user] = {};
       if (!data.byUserDay[user][day]) data.byUserDay[user][day] = { phrases: 0, utility: 0 };
       if (UTILITY_KEYS.has(key)) {
-        // Don't count heartbeats at all — they're not real usage
         if (key !== '__heartbeat__') data.byUserDay[user][day].utility++;
       } else {
         data.byUserDay[user][day].phrases++;
@@ -541,7 +560,6 @@ Rules:
 
       await redisSet(K_STATS, data);
 
-      // Record first-seen timestamp
       const firstSeen = (await redisGet(K_FIRSTSEEN)) || {};
       if (!firstSeen[user]) {
         firstSeen[user] = ts;
@@ -573,8 +591,8 @@ Rules:
       byKey,
       byUser,
       byDay,
-      byUserDay: data.byUserDay || {},   // ← NEW: accurate per-user daily counts
-      recentEvents: data.events.slice(-2000).reverse()  // increased from 200
+      byUserDay: data.byUserDay || {},
+      recentEvents: data.events.slice(-2000).reverse()
     });
     return;
   }
@@ -715,7 +733,6 @@ Rules:
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
-
 
   res.writeHead(404); res.end();
 });
