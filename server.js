@@ -20,6 +20,8 @@ const K_KILLED         = 'obs:killed';
 const K_FIRSTSEEN      = 'obs:firstseen';
 const K_EXIT           = 'obs:exit';
 const K_VERSIONS       = 'obs:versions';
+const K_RESTART        = 'obs:restart';         // per-user restart flags
+const K_VERSION_LATEST = 'obs:version-latest';  // latest AHK version string
 
 // ── Default phrases ────────────────────────────────────────────────────────
 const DEFAULT_PHRASES = {
@@ -344,6 +346,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── Map layout ────────────────────────────────────────────────────────────
+
   if (req.method==='GET' && url==='/map-layout') {
     const data = await redisGet(K_MAP_LAYOUT);
     if (!data) { json(res, 404, { error: 'No map layout saved yet' }); return; }
@@ -362,6 +365,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── Read image via OpenRouter ─────────────────────────────────────────────
+
   if (req.method==='POST' && url==='/read-image') {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
     if (!OPENROUTER_KEY) {
@@ -372,8 +376,6 @@ const server = http.createServer(async (req, res) => {
       const { imageBase64, imageMime } = JSON.parse(await readBody(req));
       if (!imageBase64 || !imageMime) { json(res, 400, { error: 'imageBase64 and imageMime required' }); return; }
 
-      // ── NEW STRUCTURED PROMPT ─────────────────────────────────────────────
-      // Returns changes[] with classCode, room, teacherCode per entry
       const prompt = `You are reading a school LSO (Learning Support Officer) daily timetable changes sheet image.
 
 Return ONLY valid JSON — no markdown fences, no explanation, nothing else. Use this exact structure:
@@ -416,13 +418,13 @@ For EACH entry in EACH cell create one object in the changes array:
 - "period": which column it is in — "p1", "p2", "p3", "p4", "p5", or "p6"
 - "type": "cover" if description contains "Cover", "cancelled" if cancelled/group cancelled, "other" for LEC/RCP/MacqLit/TAE admin/etc.
 - "description": the text after the dash (e.g. "Cover Paige", "Cover Farishat", "MacqLit for Paige", "LEC", "TAE admin")
-- "classCode": the alphanumeric code shown ABOVE the coloured box — it looks like digits followed by subject letters (e.g. "08MMAT260CRAA", "07EENG260CRAG", "07SSCI260CRAE", "07MMAT260CRAG", "08EENG260CRAD"). Copy it EXACTLY character by character.
-- "room": the text on the LEFT side of the coloured/highlighted rectangle (e.g. "BR1", "BR3", "BE1", "CL5", "CL1", "DOSC1"). Copy exactly.
-- "teacherCode": the text on the RIGHT side of the coloured/highlighted rectangle (e.g. "CRANL", "BHATM", "OVERL", "DINSS", "HEMMA", "YOUNL", "TSIAG", "CARLA"). Copy exactly.
-- If there is NO coloured box for an entry (e.g. MacqLit, LEC, RCP, TAE admin entries), set classCode: null, room: null, teacherCode: null.
+- "classCode": the alphanumeric code shown ABOVE the coloured box — copy it EXACTLY.
+- "room": the text on the LEFT side of the coloured/highlighted rectangle (e.g. "BR1", "BR3"). Copy exactly.
+- "teacherCode": the text on the RIGHT side of the coloured/highlighted rectangle (e.g. "CRANL", "BHATM"). Copy exactly.
+- If there is NO coloured box for an entry, set classCode: null, room: null, teacherCode: null.
 
 IMPORTANT:
-- Create one changes entry per person per period — if the same person has two entries in one period cell, create two objects.
+- Create one changes entry per person per period.
 - Extract every single entry from every cell. Do not skip any.
 - The "lso" field uses first name only.
 - Do not invent data — only extract what is visibly written in the image.`;
@@ -472,7 +474,6 @@ IMPORTANT:
 
       const parsed = JSON.parse(result.body);
       let text = parsed.choices?.[0]?.message?.content || '';
-      // Strip markdown code fences Gemini sometimes wraps around JSON
       text = text.replace(/^```json\s*/,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
       console.log('[read-image] Cleaned response:', text.slice(0, 200));
       json(res, 200, { text });
@@ -640,15 +641,17 @@ IMPORTANT:
     const beats    = (await redisGet(K_HEARTBEAT)) || {};
     const versions = (await redisGet(K_VERSIONS))  || {};
     const exits    = (await redisGet(K_EXIT))       || {};
+    const restarts = (await redisGet(K_RESTART))    || {};
     const now = Date.now();
     const result = {};
     for (const [user, ts] of Object.entries(beats)) {
       const ageMs = now - new Date(ts).getTime();
       result[user] = {
-        lastSeen: ts,
-        online:   ageMs < 3 * 60 * 1000,
-        version:  versions[user] || null,
-        exitPending: !!exits[user]
+        lastSeen:       ts,
+        online:         ageMs < 3 * 60 * 1000,
+        version:        versions[user] || null,
+        exitPending:    !!exits[user],
+        restartPending: !!restarts[user]
       };
     }
     json(res, 200, result);
@@ -685,14 +688,15 @@ IMPORTANT:
       const qs      = new URLSearchParams(req.url.split('?')[1]||'');
       const user    = (qs.get('user')||'').trim();
       if (!user) throw new Error('user required');
-      const killed  = (await redisGet(K_KILLED))  || {};
-      const exits   = (await redisGet(K_EXIT))     || {};
-      const shouldExit = !!exits[user];
-      if (shouldExit) {
-        delete exits[user];
-        await redisSet(K_EXIT, exits);
-      }
-      json(res, 200, { user, killed: !!killed[user], exit: shouldExit });
+      const killed   = (await redisGet(K_KILLED))  || {};
+      const exits    = (await redisGet(K_EXIT))     || {};
+      const restarts = (await redisGet(K_RESTART))  || {};
+      const shouldExit    = !!exits[user];
+      const shouldRestart = !!restarts[user];
+      // Consume flags — clear them on read so they only fire once
+      if (shouldExit)    { delete exits[user];    await redisSet(K_EXIT, exits); }
+      if (shouldRestart) { delete restarts[user]; await redisSet(K_RESTART, restarts); }
+      json(res, 200, { user, killed: !!killed[user], exit: shouldExit, restart: shouldRestart });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
@@ -732,6 +736,43 @@ IMPORTANT:
       allUsers.forEach(u => { updates[u] = true; });
       await redisSet(K_EXIT, updates);
       json(res, 200, { ok: true, flagged: [...allUsers] });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  // ── NEW: Per-user restart signal ──────────────────────────────────────────
+
+  if (req.method==='POST' && url==='/restart/user') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    try {
+      const { user } = JSON.parse(await readBody(req));
+      if (!user) throw new Error('user required');
+      const restarts = (await redisGet(K_RESTART)) || {};
+      restarts[user] = true;
+      await redisSet(K_RESTART, restarts);
+      console.log(`[restart] Signal sent to ${user}`);
+      json(res, 200, { ok: true, user });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  // ── NEW: Latest AHK version (read by script, set by admin) ───────────────
+
+  if (req.method==='GET' && url==='/version/latest') {
+    const stored = await redisGet(K_VERSION_LATEST);
+    const version = (stored && stored.version) ? stored.version : 'v3.5';
+    json(res, 200, { version });
+    return;
+  }
+
+  if (req.method==='POST' && url==='/version/latest') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    try {
+      const { version } = JSON.parse(await readBody(req));
+      if (!version || typeof version !== 'string') throw new Error('version string required');
+      await redisSet(K_VERSION_LATEST, { version: version.trim() });
+      console.log(`[version] Latest set to ${version.trim()}`);
+      json(res, 200, { ok: true, version: version.trim() });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
