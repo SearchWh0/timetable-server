@@ -688,15 +688,17 @@ IMPORTANT:
       const qs      = new URLSearchParams(req.url.split('?')[1]||'');
       const user    = (qs.get('user')||'').trim();
       if (!user) throw new Error('user required');
-      const killed   = (await redisGet(K_KILLED))  || {};
-      const exits    = (await redisGet(K_EXIT))     || {};
-      const restarts = (await redisGet(K_RESTART))  || {};
+      const killed        = (await redisGet(K_KILLED))        || {};
+      const exits         = (await redisGet(K_EXIT))          || {};
+      const restarts      = (await redisGet(K_RESTART))       || {};
+      const versionData   = await redisGet(K_VERSION_LATEST);
+      const latestVersion = (versionData && versionData.version) ? versionData.version : null;
       const shouldExit    = !!exits[user];
       const shouldRestart = !!restarts[user];
       // Consume flags — clear them on read so they only fire once
       if (shouldExit)    { delete exits[user];    await redisSet(K_EXIT, exits); }
       if (shouldRestart) { delete restarts[user]; await redisSet(K_RESTART, restarts); }
-      json(res, 200, { user, killed: !!killed[user], exit: shouldExit, restart: shouldRestart });
+      json(res, 200, { user, killed: !!killed[user], exit: shouldExit, restart: shouldRestart, latestVersion });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
