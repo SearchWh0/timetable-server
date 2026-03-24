@@ -779,6 +779,58 @@ IMPORTANT:
     return;
   }
 
+  // ── Delete user (removes from all data stores) ───────────────────────────
+
+  if (req.method==='DELETE' && url.startsWith('/user/')) {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    try {
+      const user = decodeURIComponent(url.slice('/user/'.length)).trim();
+      if (!user) throw new Error('user required');
+
+      // Remove from heartbeat
+      const beats = (await redisGet(K_HEARTBEAT)) || {};
+      delete beats[user];
+      await redisSet(K_HEARTBEAT, beats);
+
+      // Remove from versions
+      const versions = (await redisGet(K_VERSIONS)) || {};
+      delete versions[user];
+      await redisSet(K_VERSIONS, versions);
+
+      // Remove from killed
+      const killed = (await redisGet(K_KILLED)) || {};
+      delete killed[user];
+      await redisSet(K_KILLED, killed);
+
+      // Remove from firstseen
+      const firstSeen = (await redisGet(K_FIRSTSEEN)) || {};
+      delete firstSeen[user];
+      await redisSet(K_FIRSTSEEN, firstSeen);
+
+      // Remove from exit flags
+      const exits = (await redisGet(K_EXIT)) || {};
+      delete exits[user];
+      await redisSet(K_EXIT, exits);
+
+      // Remove from restart flags
+      const restarts = (await redisGet(K_RESTART)) || {};
+      delete restarts[user];
+      await redisSet(K_RESTART, restarts);
+
+      // Remove stats events for user
+      const stats = (await redisGet(K_STATS)) || { events: [] };
+      stats.events = (stats.events || []).filter(e => e.user !== user);
+      // Also remove from byUser / byUserDay if present
+      if (stats.byUser) delete stats.byUser[user];
+      if (stats.byUserDay) delete stats.byUserDay[user];
+      await redisSet(K_STATS, stats);
+
+      console.log(`[delete-user] Removed all data for ${user}`);
+      json(res, 200, { ok: true, user });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
   res.writeHead(404); res.end();
 });
 
