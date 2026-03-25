@@ -22,6 +22,7 @@ const K_EXIT           = 'obs:exit';
 const K_VERSIONS       = 'obs:versions';
 const K_RESTART        = 'obs:restart';         // per-user restart flags
 const K_VERSION_LATEST = 'obs:version-latest';  // latest AHK version string
+const K_LSO_SETTINGS   = 'obs:lso-settings';    // per-user email settings (name, domain, cc)
 
 // ── Default phrases ────────────────────────────────────────────────────────
 const DEFAULT_PHRASES = {
@@ -779,52 +780,144 @@ IMPORTANT:
     return;
   }
 
-  // ── Delete user (removes from all data stores) ───────────────────────────
+  // ── LSO settings (per-user name / domain / cc for email) ──────────────────
+
+  if (req.method==='GET' && url==='/lso-settings') {
+    try {
+      const qs   = new URLSearchParams(req.url.split('?')[1]||'');
+      const user = (qs.get('user')||'').trim();
+      if (!user) throw new Error('user required');
+      const all = (await redisGet(K_LSO_SETTINGS)) || {};
+      json(res, 200, all[user] || {});
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  if (req.method==='POST' && url==='/lso-settings') {
+    try {
+      const { user, name, domain, cc } = JSON.parse(await readBody(req));
+      if (!user) throw new Error('user required');
+      const all = (await redisGet(K_LSO_SETTINGS)) || {};
+      all[user] = { name: name||'', domain: domain||'stpeters.vic.edu.au', cc: cc||'' };
+      await redisSet(K_LSO_SETTINGS, all);
+      json(res, 200, { ok: true });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  // ── LSO email builder — called by AHK to get a ready-to-open mailto URL ───
+  // GET /lso-email?user=JohnSmith  (matches by Windows username against tt.names)
+
+  if (req.method==='GET' && url==='/lso-email') {
+    try {
+      const qs   = new URLSearchParams(req.url.split('?')[1]||'');
+      const user = (qs.get('user')||'').trim();
+      const key  = (qs.get('key')||'').trim();
+      if (!user) throw new Error('user required');
+
+      const tt = await redisGet(K_TIMETABLE);
+      if (!tt || !tt.map) throw new Error('No timetable loaded on server');
+
+      const allSettings = (await redisGet(K_LSO_SETTINGS)) || {};
+      const settings = allSettings[user] || {};
+      const domain   = settings.domain || 'stpeters.vic.edu.au';
+      const yourName = settings.name   || user;
+      const cc       = settings.cc     || '';
+
+      // Find this user's timetable group by key param, or by matching name to username
+      let grp = null, grpName = '';
+      if (key && tt.map[key]) {
+        grp = tt.map[key]; grpName = tt.names?.[key] || key;
+      } else {
+        const lowerUser = user.toLowerCase();
+        for (const [k, g] of Object.entries(tt.map)) {
+          const n = (tt.names?.[k] || '').toLowerCase();
+          if (n === lowerUser || n.replace(/\s+/g,'') === lowerUser.replace(/\s+/g,'')) {
+            grp = g; grpName = tt.names?.[k] || k; break;
+          }
+        }
+      }
+      if (!grp) throw new Error(`No timetable entry found for "${user}". Make sure your name on the timetable matches your Windows username, or save a key via the website first.`);
+
+      // Get DC changes for this person
+      const dc = await redisGet(K_DAILY_CHANGES);
+      const dcChanges = [];
+      if (dc && dc.changes) {
+        const lsoLower = grpName.toLowerCase();
+        dc.changes.forEach(ch => { if ((ch.lso||'').toLowerCase() === lsoLower) dcChanges.push(ch); });
+      }
+
+      const slots = grp.slots || {};
+      const d = new Date();
+      const dd = `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getFullYear()).slice(-2)}`;
+      const subject = `LSO ${dd}`;
+
+      function codeToPrefix(code) {
+        const lower = code.toLowerCase().trim();
+        return lower[lower.length-1] + lower.slice(0, lower.length-1);
+      }
+
+      const dcByPeriod = {};
+      dcChanges.forEach(ch => {
+        const pNum = parseInt((ch.period||'').replace('p',''), 10);
+        if (pNum >= 1 && pNum <= 6) { if (!dcByPeriod[pNum]) dcByPeriod[pNum] = []; dcByPeriod[pNum].push(ch); }
+      });
+
+      const periodLines = [];
+      const teacherMap  = new Map();
+      for (let p = 1; p <= 6; p++) {
+        const dcFP = dcByPeriod[p] || [];
+        const entries = slots[p];
+        if (dcFP.length > 0) {
+          dcFP.forEach(ch => {
+            periodLines.push(`P${p} - ${ch.classCode||ch.description||''}   ${ch.room||''}   ${ch.teacherCode||''}`.trimEnd());
+            if (ch.teacherCode) { const code = ch.teacherCode.trim().toUpperCase(); if (!teacherMap.has(code)) teacherMap.set(code, codeToPrefix(code)); }
+          });
+        } else if (entries && entries.length > 0) {
+          entries.forEach(({d1,d2,d3}) => {
+            if (d1||d2||d3) {
+              periodLines.push(`P${p} - ${d1||''}   ${d2||''}   ${d3||''}`.trimEnd());
+              if (d3) { const code = d3.trim().toUpperCase(); if (!teacherMap.has(code)) teacherMap.set(code, codeToPrefix(code)); }
+            }
+          });
+        }
+      }
+
+      const teacherEmails = [...teacherMap.values()].map(prefix => `${prefix}@${domain}`);
+      const body = [
+        'Good morning teachers,', '',
+        'Today I will be attending and supporting the students within your classes.',
+        '', ...periodLines, '',
+        `Please introduce me to the students as ${yourName}.`,
+        'I look forward to working with you today and providing effective support to our students.',
+        '', 'Kind regards,', yourName
+      ].join('\n');
+
+      const toStr  = teacherEmails.join(';');
+      const mailto = `mailto:${toStr}?cc=${encodeURIComponent(cc)}&subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+      json(res, 200, { subject, body, mailto, teacherEmails, toStr, cc, yourName, grpName });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  // ── Delete user (removes from all data stores) ────────────────────────────
 
   if (req.method==='DELETE' && url.startsWith('/user/')) {
     if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
     try {
       const user = decodeURIComponent(url.slice('/user/'.length)).trim();
       if (!user) throw new Error('user required');
-
-      // Remove from heartbeat
-      const beats = (await redisGet(K_HEARTBEAT)) || {};
-      delete beats[user];
-      await redisSet(K_HEARTBEAT, beats);
-
-      // Remove from versions
-      const versions = (await redisGet(K_VERSIONS)) || {};
-      delete versions[user];
-      await redisSet(K_VERSIONS, versions);
-
-      // Remove from killed
-      const killed = (await redisGet(K_KILLED)) || {};
-      delete killed[user];
-      await redisSet(K_KILLED, killed);
-
-      // Remove from firstseen
-      const firstSeen = (await redisGet(K_FIRSTSEEN)) || {};
-      delete firstSeen[user];
-      await redisSet(K_FIRSTSEEN, firstSeen);
-
-      // Remove from exit flags
-      const exits = (await redisGet(K_EXIT)) || {};
-      delete exits[user];
-      await redisSet(K_EXIT, exits);
-
-      // Remove from restart flags
-      const restarts = (await redisGet(K_RESTART)) || {};
-      delete restarts[user];
-      await redisSet(K_RESTART, restarts);
-
-      // Remove stats events for user
-      const stats = (await redisGet(K_STATS)) || { events: [] };
-      stats.events = (stats.events || []).filter(e => e.user !== user);
-      // Also remove from byUser / byUserDay if present
-      if (stats.byUser) delete stats.byUser[user];
+      const beats    = (await redisGet(K_HEARTBEAT)) || {}; delete beats[user];    await redisSet(K_HEARTBEAT, beats);
+      const versions = (await redisGet(K_VERSIONS))  || {}; delete versions[user]; await redisSet(K_VERSIONS, versions);
+      const killed   = (await redisGet(K_KILLED))    || {}; delete killed[user];   await redisSet(K_KILLED, killed);
+      const fs       = (await redisGet(K_FIRSTSEEN)) || {}; delete fs[user];       await redisSet(K_FIRSTSEEN, fs);
+      const exits    = (await redisGet(K_EXIT))       || {}; delete exits[user];    await redisSet(K_EXIT, exits);
+      const restarts = (await redisGet(K_RESTART))    || {}; delete restarts[user]; await redisSet(K_RESTART, restarts);
+      const stats    = (await redisGet(K_STATS))      || { events: [] };
+      stats.events = (stats.events||[]).filter(e => e.user !== user);
+      if (stats.byUser)    delete stats.byUser[user];
       if (stats.byUserDay) delete stats.byUserDay[user];
       await redisSet(K_STATS, stats);
-
       console.log(`[delete-user] Removed all data for ${user}`);
       json(res, 200, { ok: true, user });
     } catch(e) { json(res, 400, { error: e.message }); }
