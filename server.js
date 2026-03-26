@@ -824,20 +824,26 @@ IMPORTANT:
       const yourName = settings.name   || user;
       const cc       = settings.cc     || '';
 
-      // Find this user's timetable group by key param, or by matching name to username
+      // Find this user's timetable group.
+      // Priority: explicit key param -> stored display name -> raw Windows username
       let grp = null, grpName = '';
+      const searchTerms = [];
+      if (settings.name && settings.name.trim()) searchTerms.push(settings.name.trim().toLowerCase());
+      if (!searchTerms.includes(user.toLowerCase())) searchTerms.push(user.toLowerCase());
+
       if (key && tt.map[key]) {
         grp = tt.map[key]; grpName = tt.names?.[key] || key;
       } else {
-        const lowerUser = user.toLowerCase();
-        for (const [k, g] of Object.entries(tt.map)) {
-          const n = (tt.names?.[k] || '').toLowerCase();
-          if (n === lowerUser || n.replace(/\s+/g,'') === lowerUser.replace(/\s+/g,'')) {
-            grp = g; grpName = tt.names?.[k] || k; break;
+        outer: for (const term of searchTerms) {
+          for (const [k, g] of Object.entries(tt.map)) {
+            const n = (tt.names?.[k] || '').toLowerCase();
+            if (n === term || n.replace(/\s+/g,'') === term.replace(/\s+/g,'')) {
+              grp = g; grpName = tt.names?.[k] || k; break outer;
+            }
           }
         }
       }
-      if (!grp) throw new Error(`No timetable entry found for "${user}". Make sure your name on the timetable matches your Windows username, or save a key via the website first.`);
+      if (!grp) throw new Error(`No timetable entry found for "${settings.name || user}". Open the Settings dialog in the LSO tool and set your display name to exactly match what appears on the timetable (e.g. "Nathan").`);
 
       // Get DC changes for this person
       const dc = await redisGet(K_DAILY_CHANGES);
