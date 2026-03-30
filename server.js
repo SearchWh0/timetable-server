@@ -23,6 +23,7 @@ const K_VERSIONS       = 'obs:versions';
 const K_RESTART        = 'obs:restart';         // per-user restart flags
 const K_VERSION_LATEST = 'obs:version-latest';  // latest AHK version string
 const K_LSO_SETTINGS   = 'obs:lso-settings';    // per-user email settings (name, domain, cc)
+const K_EMAIL_OVERRIDES = 'email-overrides';    // teacher code → email prefix map
 
 // ── Default phrases ────────────────────────────────────────────────────────
 const DEFAULT_PHRASES = {
@@ -361,6 +362,25 @@ const server = http.createServer(async (req, res) => {
       const payload = JSON.parse(await readBody(req));
       await redisSet(K_MAP_LAYOUT, payload);
       json(res, 200, { ok: true });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  // ── Email overrides (teacher code → email prefix) ─────────────────────────
+
+  if (req.method==='GET' && url==='/email-overrides') {
+    const data = await redisGet(K_EMAIL_OVERRIDES);
+    json(res, 200, data || {});
+    return;
+  }
+
+  if (req.method==='POST' && url==='/email-overrides') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    try {
+      const payload = JSON.parse(await readBody(req));
+      if (typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Expected object');
+      await redisSet(K_EMAIL_OVERRIDES, payload);
+      json(res, 200, { ok: true, count: Object.keys(payload).length });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
