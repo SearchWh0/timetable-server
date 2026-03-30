@@ -953,6 +953,26 @@ IMPORTANT:
   res.writeHead(404); res.end();
 });
 
+// ── Midnight timetable auto-clear ─────────────────────────────────────────
+function scheduleMidnightClear() {
+  const now = new Date();
+  // Target: 23:59:00 local time
+  const next = new Date(now);
+  next.setHours(23, 59, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1); // already past, schedule tomorrow
+  const msUntil = next - now;
+  console.log(`[scheduler] Timetable auto-clear in ${Math.round(msUntil/60000)} min (at 23:59)`);
+  setTimeout(async () => {
+    try {
+      await redisDel(K_TIMETABLE);
+      console.log('[scheduler] Timetable cleared at 23:59');
+    } catch(e) {
+      console.error('[scheduler] Failed to clear timetable:', e.message);
+    }
+    scheduleMidnightClear(); // reschedule for next night
+  }, msUntil);
+}
+
 // ── Startup ────────────────────────────────────────────────────────────────
 async function start() {
   if (REDIS_URL) {
@@ -973,6 +993,7 @@ async function start() {
     console.log(`Server running on port ${PORT}`);
     console.log(`Storage: ${redis ? 'Redis (persistent ✓)' : 'in-memory (temporary)'}`);
     console.log(`Sheet today: ${sheetNameForDate(new Date()) || 'weekend'}`);
+    scheduleMidnightClear();
   });
 }
 
