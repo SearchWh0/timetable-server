@@ -24,6 +24,7 @@ const K_RESTART        = 'obs:restart';         // per-user restart flags
 const K_VERSION_LATEST = 'obs:version-latest';  // latest AHK version string
 const K_LSO_SETTINGS   = 'obs:lso-settings';    // per-user email settings (name, domain, cc)
 const K_EMAIL_OVERRIDES = 'email-overrides';    // teacher code → email prefix map
+const K_FEEDBACK        = 'obs:feedback';        // LSO feedback messages
 
 // ── Default phrases ────────────────────────────────────────────────────────
 const DEFAULT_PHRASES = {
@@ -946,6 +947,44 @@ IMPORTANT:
       await redisSet(K_STATS, stats);
       console.log(`[delete-user] Removed all data for ${user}`);
       json(res, 200, { ok: true, user });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  // ══════════════════════════════════════════════
+  //  FEEDBACK
+  // ══════════════════════════════════════════════
+
+  if (req.method==='POST' && url==='/feedback') {
+    try {
+      const { user, message } = JSON.parse(await readBody(req));
+      if (!user || !message || !message.trim()) throw new Error('user and message required');
+      const data = (await redisGet(K_FEEDBACK)) || [];
+      data.push({ id: Date.now(), ts: new Date().toISOString(), user, message: message.trim() });
+      if (data.length > 1000) data.splice(0, data.length - 1000);
+      await redisSet(K_FEEDBACK, data);
+      console.log(`[feedback] ${user}: ${message.trim().slice(0, 80)}`);
+      json(res, 200, { ok: true });
+    } catch(e) { json(res, 400, { error: e.message }); }
+    return;
+  }
+
+  if (req.method==='GET' && url==='/feedback') {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    const data = (await redisGet(K_FEEDBACK)) || [];
+    json(res, 200, data.slice().reverse()); // newest first
+    return;
+  }
+
+  if (req.method==='DELETE' && url.startsWith('/feedback/')) {
+    if (req.headers['x-admin-password']!==ADMIN_PASSWORD) { authFail(res); return; }
+    try {
+      const id = parseInt(url.slice('/feedback/'.length), 10);
+      if (!id) throw new Error('invalid id');
+      const data = (await redisGet(K_FEEDBACK)) || [];
+      const filtered = data.filter(f => f.id !== id);
+      await redisSet(K_FEEDBACK, filtered);
+      json(res, 200, { ok: true, removed: data.length - filtered.length });
     } catch(e) { json(res, 400, { error: e.message }); }
     return;
   }
