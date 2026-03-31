@@ -992,19 +992,20 @@ IMPORTANT:
   res.writeHead(404); res.end();
 });
 
-// ── Midnight timetable auto-clear ─────────────────────────────────────────
+// ── Nightly timetable auto-clear (runs at 15:30 UTC = ~1:30 AM Melbourne) ──
 function scheduleMidnightClear() {
   const now = new Date();
-  // Target: 23:59:00 local time
+  // Use UTC 15:30 — safely after midnight Melbourne time in all seasons
+  // (Melbourne is UTC+10 AEST / UTC+11 AEDT, so 15:30 UTC = 1:30–2:30 AM local)
   const next = new Date(now);
-  next.setHours(23, 59, 0, 0);
-  if (next <= now) next.setDate(next.getDate() + 1); // already past, schedule tomorrow
+  next.setUTCHours(15, 30, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1); // already past today, schedule tomorrow
   const msUntil = next - now;
-  console.log(`[scheduler] Timetable auto-clear in ${Math.round(msUntil/60000)} min (at 23:59)`);
+  console.log(`[scheduler] Timetable auto-clear in ${Math.round(msUntil/60000)} min (at 15:30 UTC)`);
   setTimeout(async () => {
     try {
       await redisDel(K_TIMETABLE);
-      console.log('[scheduler] Timetable cleared at 23:59');
+      console.log('[scheduler] Timetable cleared at 15:30 UTC');
     } catch(e) {
       console.error('[scheduler] Failed to clear timetable:', e.message);
     }
